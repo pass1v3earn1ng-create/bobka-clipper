@@ -80,27 +80,28 @@ def score_timeline(loud, speech, chatf, cfg):
     return score, parts, chat_w
 
 
-def pick_peaks(score, k, min_gap_sec=40, keep_at_least=6):
+def pick_peaks(score, min_value, at_least=3, max_peaks=400, min_gap_sec=40):
+    """All local peaks above `min_value` (at least `at_least` of them), strongest first.
+    max_peaks only keeps the speech pass within GitHub's time on a wild 10-hour stream."""
     s = score.copy()
     gap = int(min_gap_sec / HOP)
     peaks = []
-    while len(peaks) < k:
+    while len(peaks) < max_peaks:
         i = int(np.argmax(s))
         v = float(s[i])
         if v < -1e5:
             break
-        if v < 0.3 and len(peaks) >= keep_at_least:
+        if v < min_value and len(peaks) >= at_least:
             break
         peaks.append((i, v))
         s[max(0, i - gap): i + gap] = -1e6
     return peaks
 
 
-def candidates(loud, speech, chatf, cfg, n):
+def candidates(loud, speech, chatf, cfg):
     score, parts, chat_w = score_timeline(loud, speech, chatf, cfg)
-    k = max(12, int(n) * 4)
     out = []
-    for i, v in pick_peaks(score, k, keep_at_least=int(n)):
+    for i, v in pick_peaks(score, 2.0 * float(cfg.strictness), at_least=max(3, int(cfg.clips_min))):
         # the loudest point is the reaction; it usually comes right after the thing itself
         j0, j1 = max(0, i - int(6 / HOP)), min(len(score), i + int(6 / HOP))
         local = parts["excess"][j0:j1]

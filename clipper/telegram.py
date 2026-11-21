@@ -35,12 +35,13 @@ class Telegram:
                 time.sleep(min(60, wait or 5 * (attempt + 1)))
         raise RuntimeError(f"Telegram {method}: {js.get('description')}")
 
-    def text(self, text):
+    def text(self, text, silent=False):
         if not self.enabled:
             log("[telegram выключен]", text.replace("\n", " | "))
             return
         self._post("sendMessage", {"chat_id": self.chat_id, "text": text[:4000],
-                                   "disable_web_page_preview": "true"})
+                                   "disable_web_page_preview": "true",
+                                   "disable_notification": "true" if silent else "false"})
 
     def video(self, path, caption, width, height, duration):
         if not self.enabled:

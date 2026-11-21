@@ -1,16 +1,17 @@
 """From a stream recording to finished vertical clips in Telegram."""
 import json
 import os
+import time
 
 import numpy as np
 
 from . import audio, chat, detect, llm, render, text
-from .config import clips_for
 from .asr import ASR
 from .util import grab_frame, hms, human_len, log, run, stream_starts, twitch_t, video_size, \
     media_duration
 
-PRE_WIN, POST_WIN = 24.0, 10.0   # seconds of speech looked at around each loud moment
+PRE_WIN, POST_WIN = 32.0, 12.0   # seconds of speech looked at around each loud moment
+START = time.time()
 
 
 # ---------------------------------------------------------------- sources
@@ -146,8 +147,7 @@ def pick_moments(raw, comments, cfg):
     loud = audio.loudness_db(raw)
     speech = audio.speech_mask(raw, len(loud))
     chatf = chat.features(comments, len(loud), cfg.chat_delay_sec) if comments else None
-    n = clips_for(cfg, audio.duration(raw))
-    cands, chat_w = detect.candidates(loud, speech, chatf, cfg, n)
+    cands, chat_w = detect.candidates(loud, speech, chatf, cfg)
     log(f"кандидатов {len(cands)}; чат: {chatf['total'] if chatf else 0} сообщений "
         f"(вес {chat_w}), «клип» в чате: {len(chatf['marks']) if chatf else 0}")
     if not cands:
@@ -177,21 +177,25 @@ def pick_moments(raw, comments, cfg):
         log(f"  {hms(c['t'])}  итог {c['final']:+.2f}  сигнал {c['signal']:+.2f}  "
             f"текст {c['tscore']:+.2f}  громче на {c['loud_db']} дБ"
             f"{'  «клип»' if c['marked'] else ''}  {c['tfeat']}")
-    # "клип" in chat = goes in for sure, then the best of the rest
-    chosen = ([c for c in cands if c["marked"]] + [c for c in cands if not c["marked"]])[:n]
+    # no quota: every moment that is worth it goes in
+    strict = float(cfg.strictness)
+
+    def worth_it(c):
+        if c["marked"]:                      # somebody wrote "клип"
+            return True
+        if ranked:
+            return bool(c.get("llm")) and c["llm"]["score"] >= min(9.5, 6.0 * strict)
+        f = c["tfeat"]
+        reaction = c["signal"] >= 4.0 * strict and (f["words"] >= 3 or f["laugh"] >= 1)
+        emotion = c["signal"] >= 2.5 * strict and (f["laugh"] >= 1 or f["swear"] >= 1 or f["inter"] >= 2)
+        return reaction or emotion
+
+    chosen = [c for c in cands if worth_it(c)]
+    if len(chosen) < int(cfg.clips_min):   # even a quiet stream gives a few to pick from
+        have = {c["id"] for c in chosen}
+        chosen += [c for c in cands if c["id"] not in have][: int(cfg.clips_min) - len(chosen)]
     chosen.sort(key=lambda c: -c["final"])
-    # past the minimum, leave out moments that are barely louder than usual and say nothing
-    keep = []
-    for c in chosen:
-        weak = not c["marked"] and (
-            (c.get("llm") or {}).get("score", 10) < 4 if ranked
-            else c["signal"] < 2.5 and c["tscore"] < 1.0)
-        if len(keep) < int(cfg.clips_min) or not weak:
-            keep.append(c)
-    if len(keep) < len(chosen):
-        log(f"слабых моментов отброшено: {len(chosen) - len(keep)}")
-    chosen = keep
-    log(f"клипов будет: {len(chosen)} (эфир {human_len(audio.duration(raw))}, план {n})")
+    log(f"клипов будет: {len(chosen)} из {len(cands)} кандидатов")
     for c in chosen:
         lo, hi = c["win"]
         r = c.get("llm")
@@ -200,7 +204,8 @@ def pick_moments(raw, comments, cfg):
             c["start"], c["end"] = lo + r["start"], min(hi, lo + r["end"])
         else:
             c["start"], c["end"] = text.choose_bounds(text.all_words(c["segs"]), c["t"], lo, hi,
-                                                      cfg.clip_min_sec, cfg.clip_max_sec)
+                                                      cfg.clip_min_sec, cfg.clip_max_sec,
+                                                      cfg.clip_target_sec)
     return chosen, chatf
 
 
@@ -219,6 +224,28 @@ def subtitles(raw, c, cfg, subs_asr):
     return ru, en
 
 
+def _safe(what, fn):
+    try:
+        fn()
+    except Exception as e:
+        log(f"Telegram: {what} не отправилось ({e})")
+
+
+def _fetch(src, c, raw):
+    c["piece"], c["origin"] = src.piece(c["start"] - 4, c["end"] - c["start"] + 8, c["id"], raw)
+
+
+def _caption(r):
+    lines = [f"#{r['rank']} · {hms(r['start'])} · {r['dur']:.0f} сек"
+             + (" · кто-то написал «клип»" if r["marked"] else "")]
+    if r["said"]:
+        lines.append(f"«{r['said'][:300]}»")
+    if r["why"]:
+        lines.append(r["why"])
+    lines.append(r["link"])
+    return "\n".join(lines)
+
+
 def process(src, raw_path, comments, cfg, tg, st, outdir, workdir):
     outdir = os.path.abspath(outdir)
     os.makedirs(outdir, exist_ok=True)
@@ -226,59 +253,66 @@ def process(src, raw_path, comments, cfg, tg, st, outdir, workdir):
     log(f"эфир «{src.title}», {human_len(audio.duration(raw))}")
     chosen, _chatf = pick_moments(raw, comments, cfg)
     if not chosen:
-        tg.text(f"«{src.title}»: громких моментов не нашлось 🤷")
+        _safe("сообщение", lambda: tg.text(f"«{src.title}»: годных моментов не нашлось 🤷"))
         return []
-    for k, c in enumerate(chosen):
-        c["piece"], c["origin"] = src.piece(c["start"] - 4, c["end"] - c["start"] + 8, k, raw)
-    cam = find_webcam(src, chosen, cfg, st, workdir, tg)
-    src_w, src_h = video_size(chosen[0]["piece"])
+    first = chosen[:8]                      # enough frames to find the webcam
+    for c in first:
+        _fetch(src, c, raw)
+    cam = find_webcam(src, first, cfg, st, workdir, tg)
+    src_w, src_h = video_size(first[0]["piece"])
     layout = "cam_top" if cam and cfg.layout in ("auto", "cam_top") else "blur"
     geo = render.geometry(src_w, src_h, layout, cam["box"] if cam else None)
     log(f"раскладка: {geo['layout']}")
     subs_asr = ASR(cfg.whisper_subs, cfg) if cfg.subtitles else None
+    _safe("заголовок", lambda: tg.text(
+        f"🎬 {src.title}\n{human_len(src.duration)} · годных моментов: {len(chosen)}. "
+        f"присылаю по одному, сверху лучшие"))
 
+    budget = float(os.environ.get("CLIPPER_BUDGET_MIN", "250")) * 60
     results = []
     for rank_i, c in enumerate(chosen, 1):
-        dur = c["end"] - c["start"]
-        ru, en = subtitles(raw, c, cfg, subs_asr) if subs_asr else ([], [])
-        name = f"{rank_i:02d}_{hms(c['start']).replace(':', '-')}"
-        ass = render.write_ass(os.path.join(workdir, f"{name}.ass"), geo, ru, en, cfg.handle_text, dur)
-        out = os.path.join(outdir, f"{name}.mp4")
-        render.render(c["piece"], c["start"] - c["origin"], dur, geo, out, workdir, cfg.fps,
-                      os.path.basename(ass))
-        clean = None
-        if cfg.send_clean_copy:
-            clean = os.path.join(outdir, f"{name}_clean.mp4")
-            render.render(c["piece"], c["start"] - c["origin"], dur, geo, clean, workdir, cfg.fps,
-                          None)
-        said = " ".join(x["text"] for x in ru) or text.norm_line(
-            text.window_text(c["segs"], c["start"], c["end"]))
-        results.append({"rank": rank_i, "path": out, "clean": clean, "start": round(c["start"], 2),
-                        "end": round(c["end"], 2), "dur": round(dur, 2), "said": said,
-                        "why": (c.get("llm") or {}).get("why", ""), "marked": c["marked"],
-                        "loud_db": c["loud_db"], "score": round(c["final"], 2),
-                        "link": src.link(c["start"])})
-        log(f"клип {rank_i}: {hms(c['start'])} +{dur:.0f}с «{said[:60]}»")
+        if time.time() - START > budget:
+            left = len(chosen) - rank_i + 1
+            log(f"время запуска на исходе, не успеваю ещё {left}")
+            _safe("остаток", lambda: tg.text(
+                f"не успел ещё {left} клипов: GitHub даёт запуску 5 часов. лучшие уже выше", silent=True))
+            break
+        try:
+            if "piece" not in c:
+                _fetch(src, c, raw)
+            dur = c["end"] - c["start"]
+            ru, en = subtitles(raw, c, cfg, subs_asr) if subs_asr else ([], [])
+            name = f"{rank_i:02d}_{hms(c['start']).replace(':', '-')}"
+            ass = render.write_ass(os.path.join(workdir, f"{name}.ass"), geo, ru, en,
+                                   cfg.handle_text, dur)
+            out = os.path.join(outdir, f"{name}.mp4")
+            render.render(c["piece"], c["start"] - c["origin"], dur, geo, out, workdir, cfg.fps,
+                          os.path.basename(ass))
+            clean = None
+            if cfg.send_clean_copy:
+                clean = os.path.join(outdir, f"{name}_clean.mp4")
+                render.render(c["piece"], c["start"] - c["origin"], dur, geo, clean, workdir,
+                              cfg.fps, None)
+            said = " ".join(x["text"] for x in ru) or text.norm_line(
+                text.window_text(c["segs"], c["start"], c["end"]))
+            r = {"rank": rank_i, "path": out, "clean": clean, "start": round(c["start"], 2),
+                 "end": round(c["end"], 2), "dur": round(dur, 2), "said": said,
+                 "why": (c.get("llm") or {}).get("why", ""), "marked": c["marked"],
+                 "loud_db": c["loud_db"], "score": round(c["final"], 2),
+                 "link": src.link(c["start"])}
+            results.append(r)
+            log(f"клип {rank_i}: {hms(c['start'])} +{dur:.0f}с «{said[:60]}»")
+            _safe(f"клип {rank_i}", lambda: tg.video(r["path"], _caption(r), 1080, 1920, r["dur"]))
+            if clean:
+                _safe(f"чистый клип {rank_i}", lambda: tg.document(clean, f"#{rank_i} без субтитров"))
+        except Exception as e:
+            log(f"клип {rank_i} не получился: {e}")
+        finally:
+            piece = c.get("piece")
+            if piece and isinstance(src, TwitchSource) and os.path.exists(piece):
+                os.remove(piece)
 
     with open(os.path.join(outdir, "clips.json"), "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=1)
-    deliver(tg, src, results)
+    _safe("итог", lambda: tg.text(f"всё, {len(results)} клипов с «{src.title}»", silent=True))
     return results
-
-
-def deliver(tg, src, results):
-    try:
-        tg.text(f"🎬 {src.title}\n{human_len(src.duration)} · клипов: {len(results)}, сверху лучший")
-        for r in results:
-            lines = [f"#{r['rank']} · {hms(r['start'])} · {r['dur']:.0f} сек"
-                     + (" · кто-то написал «клип»" if r["marked"] else "")]
-            if r["said"]:
-                lines.append(f"«{r['said'][:300]}»")
-            if r["why"]:
-                lines.append(r["why"])
-            lines.append(r["link"])
-            tg.video(r["path"], "\n".join(lines), 1080, 1920, r["dur"])
-            if r["clean"]:
-                tg.document(r["clean"], f"#{r['rank']} без субтитров")
-    except Exception as e:
-        log(f"Telegram не принял клипы: {e} — они лежат в архиве запуска (Artifacts)")

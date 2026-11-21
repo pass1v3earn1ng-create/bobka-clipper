@@ -39,6 +39,17 @@ def _json(text):
 def rank(cfg, cands, min_len, max_len):
     if not cfg.anthropic_key or not cands:
         return None
+    out = {}
+    for i in range(0, len(cands), 40):
+        part = _rank_batch(cfg, cands[i:i + 40], min_len, max_len)
+        if part is None and not out:
+            return None
+        out.update(part or {})
+    log(f"Claude оценил {len(out)} моментов")
+    return out or None
+
+
+def _rank_batch(cfg, cands, min_len, max_len):
     blocks = []
     for c in cands:
         w0, w1 = c["win"]
@@ -48,7 +59,9 @@ def rank(cfg, cands, min_len, max_len):
         blocks.append(f"id: {c['id']}\nwindow: 0-{w1 - w0:.0f} s, reaction peak at {c['t'] - w0:.1f} s, "
                       f"loudness +{c['loud_db']} dB{', viewers wrote CLIP here' if c['marked'] else ''}\n"
                       f"speech:\n{speech}\nchat:\n{chat}")
-    user = f"Clip length must be {min_len:.0f}-{max_len:.0f} s.\n\n" + "\n\n---\n\n".join(blocks)
+    user = (f"Clip length must be {min_len:.0f}-{max_len:.0f} s, ideally about {cfg.clip_target_sec:.0f} s: "
+            f"enough build-up to get what is going on, then the moment and the reaction.\n\n"
+            + "\n\n---\n\n".join(blocks))
     try:
         data = _json(_call(cfg, RANK_SYS, user, 4000))
     except Exception as e:
@@ -61,8 +74,7 @@ def rank(cfg, cands, min_len, max_len):
                                  "end": float(d["end"]), "why": str(d.get("why", ""))[:80]}
         except (KeyError, TypeError, ValueError):
             continue
-    log(f"Claude оценил {len(out)} моментов")
-    return out or None
+    return out
 
 
 def translate(cfg, lines):

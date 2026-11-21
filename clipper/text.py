@@ -38,27 +38,27 @@ def text_score(segs, peak):
     return score, f
 
 
-def choose_bounds(words, peak, lo, hi, min_len, max_len, lead=9.0):
-    """Cut so the reaction lands near the end and the clip starts ~`lead` s before it,
-    preferably where a phrase begins."""
+def choose_bounds(words, peak, lo, hi, min_len, max_len, target=22.0, tail=6.0):
+    """Cut ~`target` s: the build-up first, the reaction (peak) about `tail` s before the end.
+    The start lands on a pause between phrases when there is one nearby."""
     words = sorted(words, key=lambda w: w["start"])
-    end = peak + 4.0
+    end = peak + tail
     for w in words:  # let the phrase being said at the end finish
-        if w["start"] <= end + 0.6 and w["end"] > end - 0.3 and w["end"] <= peak + 9:
+        if w["start"] <= end + 0.6 and w["end"] > end - 0.3 and w["end"] <= peak + tail + 5:
             end = max(end, w["end"] + 0.35)
     end = min(end, hi)
     earliest = max(lo, end - max_len)
     latest = max(earliest, end - min_len)
-    target = min(max(peak - lead, earliest), latest)
+    goal = min(max(end - target, earliest), latest)
     best = None
     starts = [nxt["start"] for prev, nxt in zip(words, words[1:]) if nxt["start"] - prev["end"] >= 0.35]
     if words:
         starts.append(words[0]["start"])
     for ws in starts:
         s = ws - 0.25
-        if earliest <= s <= latest and (best is None or abs(s - target) < best[0]):
-            best = (abs(s - target), s)
-    start = best[1] if best and best[0] <= 2.5 else target
+        if earliest <= s <= latest and (best is None or abs(s - goal) < best[0]):
+            best = (abs(s - goal), s)
+    start = best[1] if best and best[0] <= 3.0 else goal
     for w in words:  # never start in the middle of a word
         if w["start"] < start < w["end"]:
             start = w["start"] - 0.1 if w["start"] - 0.1 >= earliest else min(w["end"] + 0.05, latest)
