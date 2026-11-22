@@ -2,24 +2,35 @@
  "cam": {
   "box": [
    0.0,
-   0.0037,
-   0.2104,
-   0.5519
+   0.0,
+   0.1917,
+   0.2556
   ],
   "face": [
-   0.1042,
-   0.1035,
-   0.0396,
-   0.0959
+   0.0967,
+   0.099,
+   0.0392,
+   0.0921
   ],
   "frames": 24,
-  "hits": 23,
+  "hits": 21,
   "how": "рамка вебки"
  },
  "vods": {
   "2932890720": {
    "at": "2026-11-22 03:20",
    "clips": 259,
+   "status": "done",
+   "title": "GTA 6 Full Walkthough 100% IRL/UKR"
+  },
+  "2934018958": {
+   "at": "2026-11-22 05:22",
+   "status": "skipped",
+   "title": "GTA 6 Full Walkthough 100% IRL/UKR"
+  },
+  "2935169241": {
+   "at": "2026-11-22 07:27",
+   "clips": 100,
    "status": "done",
    "title": "GTA 6 Full Walkthough 100% IRL/UKR"
   }
