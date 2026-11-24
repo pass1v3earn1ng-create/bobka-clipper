@@ -127,15 +127,17 @@ def find_webcam(src, chosen, cfg, st, workdir, tg):
         imgs = [im for im in imgs if im.shape == size]
     debug = os.path.join(workdir, "webcam.jpg")
     cam = facecam.detect(imgs, debug_path=debug) if len(imgs) >= 3 else None
-    prev = st.get("cam")
+    key = cfg.get("channel_key") or cfg["channel"]
+    cams = st.setdefault("cams", {})
+    prev = cams.get(key) or (st.get("cam") if not cfg.get("is_other") else None)
     if cam:
         if not prev or _iou(prev["box"], cam["box"]) < 0.7:
             try:
-                tg.photo(debug, "так вижу вебку (зелёная рамка) — она пойдёт сверху клипа. "
-                                "если рамка мимо, пропиши cam_box в config.yaml")
+                tg.photo(debug, cfg.get("label", "") + "так вижу вебку (зелёная рамка) — она пойдёт "
+                                "сверху клипа. если рамка мимо, пропиши cam_box в config.yaml")
             except Exception as e:
                 log(f"не отправил кадр с вебкой: {e}")
-        st["cam"] = cam
+        cams[key] = cam
         return cam
     if prev and cfg.layout != "blur":
         log("беру прошлое положение вебки")
@@ -181,7 +183,7 @@ def pick_moments(raw, comments, cfg):
     strict = float(cfg.strictness)
 
     def worth_it(c):
-        if c["marked"]:                      # somebody wrote "клип"
+        if c["marked"] and cfg.get("force_marks", True):   # somebody wrote "клип"
             return True
         if ranked:
             return bool(c.get("llm")) and c["llm"]["score"] >= min(9.5, 6.0 * strict)
@@ -195,8 +197,9 @@ def pick_moments(raw, comments, cfg):
         return c["marked"] or f["words"] >= 3 or f["laugh"] >= 1 or c["loud_db"] >= 12
 
     cap = int(cfg.clips_max)
-    marked = [c for c in cands if c["marked"]]
-    rest = [c for c in cands if not c["marked"] and has_something(c)]
+    force = bool(cfg.get("force_marks", True))
+    marked = [c for c in cands if c["marked"]] if force else []
+    rest = [c for c in cands if (not force or not c["marked"]) and has_something(c)]
     if ranked:
         rest = [c for c in rest if c.get("llm") and c["llm"]["score"] >= min(9.5, 5.0 * strict)]
     if cap:   # only the strongest few of this stream (cands are sorted best first)
@@ -266,7 +269,7 @@ def process(src, raw_path, comments, cfg, tg, st, outdir, workdir):
     log(f"эфир «{src.title}», {human_len(audio.duration(raw))}")
     chosen, _chatf = pick_moments(raw, comments, cfg)
     if not chosen:
-        _safe("сообщение", lambda: tg.text(f"«{src.title}»: годных моментов не нашлось 🤷"))
+        _safe("сообщение", lambda: tg.text(cfg.get("label", "") + f"«{src.title}»: годных моментов не нашлось 🤷"))
         return []
     first = chosen[:8]                      # enough frames to find the webcam
     for c in first:
@@ -278,7 +281,7 @@ def process(src, raw_path, comments, cfg, tg, st, outdir, workdir):
     log(f"раскладка: {geo['layout']}")
     subs_asr = ASR(cfg.whisper_subs, cfg) if cfg.subtitles else None
     _safe("заголовок", lambda: tg.text(
-        f"🎬 {src.title}\n{human_len(src.duration)} · лучших моментов: {len(chosen)}. "
+        cfg.get("label", "") + f"🎬 {src.title}\n{human_len(src.duration)} · лучших моментов: {len(chosen)}. "
         f"присылаю по одному, сверху лучшие"))
 
     budget = float(os.environ.get("CLIPPER_BUDGET_MIN", "250")) * 60
@@ -327,5 +330,8 @@ def process(src, raw_path, comments, cfg, tg, st, outdir, workdir):
 
     with open(os.path.join(outdir, "clips.json"), "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=1)
-    _safe("итог", lambda: tg.text(f"всё, {len(results)} клипов с «{src.title}»", silent=True))
+    n = len(results)
+    word = "клип" if n % 10 == 1 and n % 100 != 11 else \
+        "клипа" if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14) else "клипов"
+    _safe("итог", lambda: tg.text(cfg.get("label", "") + f"всё, {n} {word} с «{src.title}»", silent=True))
     return results

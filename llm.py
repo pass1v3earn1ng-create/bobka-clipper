@@ -7,7 +7,7 @@ from .util import log
 
 API = "https://api.anthropic.com/v1/messages"
 
-RANK_SYS = """You pick clips from a Russian-language GTA 6 stream by a small streamer (20-something, swears, dark humour).
+RANK_SYS = """You pick clips from a live stream (the game and language vary; the streamer may swear and joke darkly).
 For each candidate you get what was said in a ~35 s window (times in seconds from the window start), chat lines and loudness.
 Judge how well it works as a standalone TikTok/Shorts clip: something funny, a fail, rage, a wtf moment, hype, a sharp line.
 Boring talk, menus, silence and game cutscene dialogue score low. The clip must make sense from its very first second.
